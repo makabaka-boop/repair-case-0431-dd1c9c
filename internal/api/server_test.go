@@ -675,6 +675,22 @@ func TestHTTPSealGroupThreeWayRace(t *testing.T) {
 			if r.code == 0 {
 				t.Fatalf("round %d: transport error in race", i)
 			}
+			// A 200 group seal must never report a member still OPEN: that
+			// response is the handoff verdict and has to match the committed
+			// database state.
+			if r.code == 200 {
+				members, _ := r.body["batches"].([]any)
+				if len(members) != 2 {
+					t.Fatalf("round %d: 200 group response without 2 members: %v", i, r.body)
+				}
+				for _, m := range members {
+					member := m.(map[string]any)
+					if member["status"] != "SEALED" || member["sealedAt"] == nil {
+						t.Fatalf("round %d: 200 group response reports member %v still OPEN "+
+							"without sealedAt (self-contradictory handoff)", i, member)
+					}
+				}
+			}
 		}
 
 		code, snapA := c.get(t, u1+"/api/v1/batches/"+a)
@@ -689,6 +705,25 @@ func TestHTTPSealGroupThreeWayRace(t *testing.T) {
 		sealedB := snapB["status"] == "SEALED"
 		if sealedA != sealedB {
 			t.Fatalf("round %d: group partially sealed: A=%v B=%v", i, snapA["status"], snapB["status"])
+		}
+		// When the group sealed, every 200 response's sealedAt has to equal
+		// the value now observable in the database for that member.
+		if sealedA {
+			dbByID := map[string]any{a: snapA["sealedAt"], b: snapB["sealedAt"]}
+			for _, r := range results {
+				if r.code != 200 {
+					continue
+				}
+				members, _ := r.body["batches"].([]any)
+				for _, m := range members {
+					member := m.(map[string]any)
+					id := member["batchId"].(string)
+					if member["sealedAt"] != dbByID[id] {
+						t.Fatalf("round %d: response sealedAt %v disagrees with database %v for %s",
+							i, member["sealedAt"], dbByID[id], id)
+					}
+				}
+			}
 		}
 		if sealedA {
 			if int(snapA["received"].(float64)) != 1 || int(snapB["received"].(float64)) != 1 {

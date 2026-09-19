@@ -383,15 +383,17 @@ func (s *Store) SealGroup(ctx context.Context, ids []string) ([]*Snapshot, error
 		}
 	}
 
-	// End the read-only validation transaction before applying the write so
-	// row locks are not held while UPDATE results are collected.
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-
-	// Seal every OPEN member in one statement; SEALED members are untouched
-	// and keep their stored sealedAt.
-	sealRows, err := s.pool.Query(ctx,
+	// Seal every OPEN member from inside THIS transaction while the FOR
+	// UPDATE locks are still held. The write must never be split off into a
+	// separate auto-committed statement: after this transaction commits the
+	// locks are released, and a SealBatch or another SealGroup interleaved in
+	// that gap could seal one member before another, or make this statement
+	// match zero rows while the in-memory snapshots above still report OPEN —
+	// a 200 response contradicting the database. Under the locks the UPDATE
+	// is atomic with the gap validation, and one now() value stamps every
+	// member the group seals; SEALED members are untouched and keep their
+	// stored sealedAt.
+	sealRows, err := tx.Query(ctx,
 		`UPDATE batches SET status = $1, sealed_at = now()
 		 WHERE id = ANY($2) AND status = $3
 		 RETURNING id, sealed_at`, StatusSealed, sorted, StatusOpen)
@@ -411,6 +413,10 @@ func (s *Store) SealGroup(ctx context.Context, ids []string) ([]*Snapshot, error
 	}
 	sealRows.Close()
 	if err := sealRows.Err(); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 

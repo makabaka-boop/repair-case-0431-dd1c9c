@@ -60,6 +60,7 @@ func newStore(ctx context.Context, t *testing.T) (s *store.Store, peer func() *s
 		defer cancel()
 		_, _ = basePool.Exec(cleanupCtx, "DROP SCHEMA "+schema+" CASCADE")
 	})
+	testSchemas.Store(t.Name(), schema)
 
 	open := func() *store.Store {
 		st, err := store.New(ctx, schemaURL(schema))
@@ -88,6 +89,7 @@ func containsQ(u string) bool {
 	return false
 }
 
+// mustBatch creates a batch or fails the test.
 func mustBatch(ctx context.Context, t *testing.T, s *store.Store, expected int) *store.Batch {
 	t.Helper()
 	b, err := s.CreateBatch(ctx, expected)
@@ -95,6 +97,21 @@ func mustBatch(ctx context.Context, t *testing.T, s *store.Store, expected int) 
 		t.Fatalf("create batch: %v", err)
 	}
 	return b
+}
+
+// testSchemas records the isolated schema newStore creates per test, so tests
+// that stage interleavings on raw base-pool connections (search_path public
+// by default) can qualify table names explicitly.
+var testSchemas sync.Map // t.Name() -> schema
+
+// testSchema returns the isolated schema created for the current test.
+func testSchema(t *testing.T) string {
+	t.Helper()
+	v, ok := testSchemas.Load(t.Name())
+	if !ok {
+		t.Fatalf("no test schema recorded for %s", t.Name())
+	}
+	return v.(string)
 }
 
 // TestConcurrentFirstBootMigrate points many brand-new stores at one fresh
@@ -609,9 +626,10 @@ func TestSealGroupThreeWayRace(t *testing.T) {
 		opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		var wg sync.WaitGroup
 		wg.Add(3)
+		var snapsAB, snapsBA []*store.Snapshot
 		var errAB, errBA error
-		go func() { defer wg.Done(); _, errAB = s.SealGroup(opCtx, []string{a.ID, b.ID}) }()
-		go func() { defer wg.Done(); _, errBA = p2.SealGroup(opCtx, []string{b.ID, a.ID}) }()
+		go func() { defer wg.Done(); snapsAB, errAB = s.SealGroup(opCtx, []string{a.ID, b.ID}) }()
+		go func() { defer wg.Done(); snapsBA, errBA = p2.SealGroup(opCtx, []string{b.ID, a.ID}) }()
 		go func() { defer wg.Done(); _, _ = p3.SubmitChunk(opCtx, b.ID, 1, []byte("final")) }()
 
 		done := make(chan struct{})
@@ -642,6 +660,31 @@ func TestSealGroupThreeWayRace(t *testing.T) {
 		if sealedA != sealedB {
 			t.Fatalf("round %d: group partially sealed: A=%s B=%s", i, snapA.Status, snapB.Status)
 		}
+		// A 200 response must never contradict the database: every member it
+		// reports has to be SEALED with a sealedAt equal to the stored one.
+		assertGroupResponseConsistent := func(label string, ordered []*store.Snapshot, e error) {
+			t.Helper()
+			if e != nil {
+				return // INCOMPLETE responses carry no success snapshot
+			}
+			for _, got := range ordered {
+				var stored *store.Snapshot
+				switch got.ID {
+				case a.ID:
+					stored = snapA
+				case b.ID:
+					stored = snapB
+				}
+				if got.Status != stored.Status ||
+					(got.SealedAt == nil) != (stored.SealedAt == nil) ||
+					(got.SealedAt != nil && !got.SealedAt.Equal(*stored.SealedAt)) {
+					t.Fatalf("round %d: %s 200 snapshot %+v disagrees with database %+v",
+						i, label, got, stored)
+				}
+			}
+		}
+		assertGroupResponseConsistent("[A,B]", snapsAB, errAB)
+		assertGroupResponseConsistent("[B,A]", snapsBA, errBA)
 		if sealedA {
 			if len(snapA.Gaps) != 0 || len(snapB.Gaps) != 0 {
 				t.Fatalf("round %d: SEALED with gaps: %+v %+v", i, snapA, snapB)
@@ -681,8 +724,9 @@ func TestSealGroupVsSingleSealRace(t *testing.T) {
 
 		var wg sync.WaitGroup
 		wg.Add(2)
+		var groupSnaps []*store.Snapshot
 		var groupErr, singleErr error
-		go func() { defer wg.Done(); _, groupErr = s.SealGroup(ctx, []string{a.ID, b.ID}) }()
+		go func() { defer wg.Done(); groupSnaps, groupErr = s.SealGroup(ctx, []string{a.ID, b.ID}) }()
 		go func() { defer wg.Done(); _, singleErr = other.SealBatch(ctx, b.ID) }()
 		wg.Wait()
 
@@ -701,6 +745,18 @@ func TestSealGroupVsSingleSealRace(t *testing.T) {
 			t.Fatalf("round %d: expected both SEALED: %s / %s", i, snapA.Status, snapB.Status)
 		}
 
+		// The 200 group response has to agree with the database for both
+		// members — the indivisible unit can never be reported half-open.
+		stored := map[string]*store.Snapshot{a.ID: snapA, b.ID: snapB}
+		for _, got := range groupSnaps {
+			want := stored[got.ID]
+			if got.Status != want.Status || got.SealedAt == nil ||
+				!got.SealedAt.Equal(*want.SealedAt) {
+				t.Fatalf("round %d: group response %+v disagrees with database %+v",
+					i, got, want)
+			}
+		}
+
 		// A second group seal must not move either sealedAt.
 		again, err := s.SealGroup(ctx, []string{a.ID, b.ID})
 		if err != nil {
@@ -708,6 +764,273 @@ func TestSealGroupVsSingleSealRace(t *testing.T) {
 		}
 		if !again[0].SealedAt.Equal(*snapA.SealedAt) || !again[1].SealedAt.Equal(*snapB.SealedAt) {
 			t.Fatalf("round %d: sealedAt moved on reseal", i)
+		}
+	}
+}
+
+// waitForTupleLock polls until some backend is blocked on the batches row
+// with batchID, returning false on timeout. PostgreSQL does not publish a
+// lock holder's FOR UPDATE row lock in pg_locks — only the contender shows
+// up, carrying a granted (prospective) tuple lock on that row together with
+// an ungranted lock it is sleeping on (the holder's transactionid). So a
+// waiter on a given row is: a backend whose granted tuple lock matches the
+// row's ctid and which also holds any ungranted lock. The raw base pool
+// defaults to the public search path while test tables live in an isolated
+// schema, so names are qualified explicitly.
+func waitForTupleLock(ctx context.Context, t *testing.T, schema, batchID string) bool {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		err := basePool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_locks tl
+				JOIN `+schema+`.batches b
+				  ON tl.page = (b.ctid::text::point)[0]::int
+				 AND tl.tuple = (b.ctid::text::point)[1]::int
+				WHERE tl.locktype = 'tuple' AND tl.granted = true
+				  AND tl.relation = ($1 || '.batches')::regclass
+				  AND b.id = $2
+				  AND EXISTS (
+					SELECT 1 FROM pg_locks w
+					WHERE w.pid = tl.pid AND w.granted = false
+				  )
+			)`, schema, batchID).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("scan lock state: %v", err)
+		}
+		if waiting {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
+}
+
+// TestSealGroupReversedRequestsResponseMatchesDB deterministically reproduces
+// the reversed-order group race: [A,B] and [B,A] validate while holding the
+// same locks in series, then (in the buggy implementation) both applied their
+// UPDATE outside the locking transaction. The loser's UPDATE matched zero
+// rows yet it returned 200 with OPEN snapshots carrying no sealedAt while the
+// database already showed SEALED — a self-contradictory handoff.
+func TestSealGroupReversedRequestsResponseMatchesDB(t *testing.T) {
+	ctx := context.Background()
+	s, newPeer := newStore(ctx, t)
+	peer := newPeer()
+	defer peer.Close()
+
+	a := mustBatch(ctx, t, s, 1)
+	b := mustBatch(ctx, t, s, 1)
+	for _, id := range []string{a.ID, b.ID} {
+		if _, err := s.SubmitChunk(ctx, id, 1, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Stage the interleaving with a blocker transaction on a raw connection:
+	// hold B's row lock so G1 locks A and parks on B; G2 locks in the same
+	// ascending order and queues right behind it.
+	blocker, err := basePool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(ctx)
+	schema := testSchema(t)
+	if _, err := blocker.Exec(ctx, "SET LOCAL search_path = "+schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blocker.Exec(ctx, `SELECT id FROM batches WHERE id = $1 FOR UPDATE`, b.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	g1Done := make(chan struct{})
+	var snapsAB []*store.Snapshot
+	var errAB error
+	go func() {
+		defer close(g1Done)
+		snapsAB, errAB = s.SealGroup(ctx, []string{a.ID, b.ID})
+	}()
+	if !waitForTupleLock(ctx, t, schema, b.ID) {
+		t.Fatal("G1 never parked waiting for B's row lock")
+	}
+
+	g2Done := make(chan struct{})
+	var snapsBA []*store.Snapshot
+	var errBA error
+	go func() {
+		defer close(g2Done)
+		snapsBA, errBA = peer.SealGroup(ctx, []string{b.ID, a.ID})
+	}()
+
+	// Release B: G1 wins, seals the group and returns; G2 then serialises
+	// behind it and must observe the committed verdict.
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-g1Done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("winning group call deadlocked")
+	}
+	select {
+	case <-g2Done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("losing group call deadlocked")
+	}
+
+	if errAB != nil || errBA != nil {
+		t.Fatalf("both reversed groups must succeed: %v / %v", errAB, errBA)
+	}
+
+	// Every 200 response snapshot must be SEALED, carry sealedAt, and agree
+	// byte-for-byte with the database verdict.
+	dbA, err := s.Snapshot(ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbB, err := s.Snapshot(ctx, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dbA.Status != store.StatusSealed || dbB.Status != store.StatusSealed {
+		t.Fatalf("database group not sealed: %s / %s", dbA.Status, dbB.Status)
+	}
+	assertResponseMatchesDB := func(label string, ordered []*store.Snapshot, want0, want1 string) {
+		t.Helper()
+		if len(ordered) != 2 || ordered[0].ID != want0 || ordered[1].ID != want1 {
+			t.Fatalf("%s: snapshots not in request order: %+v", label, ordered)
+		}
+		for _, snap := range ordered {
+			if snap.Status != store.StatusSealed || snap.SealedAt == nil {
+				t.Fatalf("%s: 200 response reports member %s still OPEN (status=%s sealedAt=%v) "+
+					"but the database shows it sealed", label, snap.ID, snap.Status, snap.SealedAt)
+			}
+		}
+		if !ordered[0].SealedAt.Equal(*dbA.SealedAt) || !ordered[1].SealedAt.Equal(*dbB.SealedAt) {
+			t.Fatalf("%s: response sealedAt disagrees with database", label)
+		}
+	}
+	assertResponseMatchesDB("[A,B]", snapsAB, a.ID, b.ID)
+	assertResponseMatchesDB("[B,A]", snapsBA, b.ID, a.ID)
+}
+
+// TestSealGroupVsSingleSealDeterministic stages the documented interleave:
+// the group has locked every member and passed its post-lock validation
+// (still inside the locking transaction) while B's single-batch seal waits
+// on the group's row lock. The group UPDATE therefore has to be atomic with
+// the validation transaction; if it is split off after the locks release,
+// the queued SealBatch slips in first and seals B on its own, after which the
+// pooled group UPDATE only seals A — the two members end up sealed by
+// different operations and the group can be observed half sealed.
+func TestSealGroupVsSingleSealDeterministic(t *testing.T) {
+	ctx := context.Background()
+	s, newPeer := newStore(ctx, t)
+	peer := newPeer()
+	defer peer.Close()
+
+	first := mustBatch(ctx, t, s, 1)
+	second := mustBatch(ctx, t, s, 1)
+	for _, id := range []string{first.ID, second.ID} {
+		if _, err := s.SubmitChunk(ctx, id, 1, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// SealGroup locks rows in ascending ID order. To make the group park
+	// while still holding the single seal's row, the blocker must hold the
+	// HIGH id (last locked) and the single seal targets the LOW id (already
+	// locked by the parked group).
+	loID, hiID := first.ID, second.ID
+	if loID > hiID {
+		loID, hiID = hiID, loID
+	}
+
+	blocker, err := basePool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(ctx)
+	schema := testSchema(t)
+	if _, err := blocker.Exec(ctx, "SET LOCAL search_path = "+schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blocker.Exec(ctx, `SELECT id FROM batches WHERE id = $1 FOR UPDATE`, hiID); err != nil {
+		t.Fatal(err)
+	}
+
+	groupDone := make(chan struct{})
+	var groupSnaps []*store.Snapshot
+	var groupErr error
+	go func() {
+		defer close(groupDone)
+		groupSnaps, groupErr = s.SealGroup(ctx, []string{first.ID, second.ID})
+	}()
+	if !waitForTupleLock(ctx, t, schema, hiID) {
+		t.Fatal("group never parked waiting for the high row lock")
+	}
+
+	singleDone := make(chan struct{})
+	var singleErr error
+	go func() {
+		defer close(singleDone)
+		_, singleErr = peer.SealBatch(ctx, loID)
+	}()
+
+	// The single seal must be queued behind the group on the low row.
+	if !waitForTupleLock(ctx, t, schema, loID) {
+		t.Fatal("single-batch seal never queued behind the group")
+	}
+
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-groupDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("group seal deadlocked")
+	}
+	select {
+	case <-singleDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("single seal deadlocked")
+	}
+
+	if groupErr != nil || singleErr != nil {
+		t.Fatalf("group=%v single=%v", groupErr, singleErr)
+	}
+
+	dbLo, err := s.Snapshot(ctx, loID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbHi, err := s.Snapshot(ctx, hiID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dbLo.Status != store.StatusSealed || dbHi.Status != store.StatusSealed {
+		t.Fatalf("expected both sealed: %s / %s", dbLo.Status, dbHi.Status)
+	}
+	// The group sealed both members in one statement while holding the
+	// locks, so both timestamps come from the same group operation.
+	if !dbLo.SealedAt.Equal(*dbHi.SealedAt) {
+		t.Fatalf("members sealed by different operations: %v vs %v",
+			dbLo.SealedAt, dbHi.SealedAt)
+	}
+
+	// The group's 200 snapshots must match the database verdict for every
+	// member (request order is the created order [first, second]).
+	if len(groupSnaps) != 2 || groupSnaps[0].ID != first.ID || groupSnaps[1].ID != second.ID {
+		t.Fatalf("group snapshots not in request order: %+v", groupSnaps)
+	}
+	dbByID := map[string]*store.Snapshot{loID: dbLo, hiID: dbHi}
+	for _, snap := range groupSnaps {
+		db := dbByID[snap.ID]
+		if snap.Status != store.StatusSealed || snap.SealedAt == nil {
+			t.Fatalf("group response member %s reports %s without sealedAt", snap.ID, snap.Status)
+		}
+		if !snap.SealedAt.Equal(*db.SealedAt) {
+			t.Fatalf("member %s response sealedAt %v disagrees with database %v",
+				snap.ID, snap.SealedAt, db.SealedAt)
 		}
 	}
 }
