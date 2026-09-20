@@ -585,11 +585,89 @@ func TestSealGroupKeepsExistingSealedAt(t *testing.T) {
 	}
 }
 
+// TestSealGroupReversedResponsesMatchDatabase hammers two complete batches with
+// [A,B] and [B,A] group seals from independent pools at the same time. The
+// group that loses the lock race must observe the winner's committed rows
+// under its own locks and echo them: every successful response has to match a
+// fresh database read. Previously the verdict and the UPDATE lived in separate
+// transactions, so the loser could answer 200 with stale OPEN members and no
+// sealedAt while the database already held both members SEALED.
+func TestSealGroupReversedResponsesMatchDatabase(t *testing.T) {
+	ctx := context.Background()
+	s, newPeer := newStore(ctx, t)
+	p2 := newPeer()
+	defer p2.Close()
+
+	const rounds = 50
+	for i := 0; i < rounds; i++ {
+		a := mustBatch(ctx, t, s, 1)
+		b := mustBatch(ctx, t, s, 1)
+		for _, id := range []string{a.ID, b.ID} {
+			if _, err := s.SubmitChunk(ctx, id, 1, []byte("x")); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var ab, ba []*store.Snapshot
+		var errAB, errBA error
+		go func() { defer wg.Done(); ab, errAB = s.SealGroup(ctx, []string{a.ID, b.ID}) }()
+		go func() { defer wg.Done(); ba, errBA = p2.SealGroup(ctx, []string{b.ID, a.ID}) }()
+		wg.Wait()
+
+		if errAB != nil || errBA != nil {
+			t.Fatalf("round %d: group errors ab=%v ba=%v", i, errAB, errBA)
+		}
+		if len(ab) != 2 || ab[0].ID != a.ID || ab[1].ID != b.ID ||
+			len(ba) != 2 || ba[0].ID != b.ID || ba[1].ID != a.ID {
+			t.Fatalf("round %d: snapshots not in request order: ab=%+v ba=%+v", i, ab, ba)
+		}
+
+		// Every successful response must equal the committed database view.
+		for _, got := range append(ab, ba...) {
+			dbSnap, err := s.Snapshot(ctx, got.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != store.StatusSealed || dbSnap.Status != store.StatusSealed {
+				t.Fatalf("round %d: member %s response=%s db=%s, both must be SEALED",
+					i, got.ID, got.Status, dbSnap.Status)
+			}
+			if got.SealedAt == nil {
+				t.Fatalf("round %d: response seals %s without sealedAt", i, got.ID)
+			}
+			if !got.SealedAt.Equal(*dbSnap.SealedAt) {
+				t.Fatalf("round %d: sealedAt mismatch for %s: response=%v db=%v",
+					i, got.ID, got.SealedAt, dbSnap.SealedAt)
+			}
+			if got.Received != got.ExpectedChunks || len(got.Gaps) != 0 {
+				t.Fatalf("round %d: response member not a clean seal: %+v", i, got)
+			}
+		}
+
+		// Both members transitioned inside the winner's single transaction.
+		snapA, err := s.Snapshot(ctx, a.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapB, err := s.Snapshot(ctx, b.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !snapA.SealedAt.Equal(*snapB.SealedAt) {
+			t.Fatalf("round %d: members sealed in different transactions: %v vs %v",
+				i, snapA.SealedAt, snapB.SealedAt)
+		}
+	}
+}
+
 // TestSealGroupThreeWayRace fires the [A,B] group, the reversed [B,A] group
 // and B's final chunk from three independent pools at the same time. The
 // shared row-lock arbitration must serialise them without deadlock, and the
 // only legal outcomes are the whole group SEALED (by exactly one transaction,
-// so both members carry the same sealedAt) or no new seal at all.
+// so both members carry the same sealedAt) or no new seal at all. Every
+// response snapshot must also agree with the committed database state.
 func TestSealGroupThreeWayRace(t *testing.T) {
 	ctx := context.Background()
 	s, newPeer := newStore(ctx, t)
@@ -609,9 +687,10 @@ func TestSealGroupThreeWayRace(t *testing.T) {
 		opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		var wg sync.WaitGroup
 		wg.Add(3)
+		var snapsAB, snapsBA []*store.Snapshot
 		var errAB, errBA error
-		go func() { defer wg.Done(); _, errAB = s.SealGroup(opCtx, []string{a.ID, b.ID}) }()
-		go func() { defer wg.Done(); _, errBA = p2.SealGroup(opCtx, []string{b.ID, a.ID}) }()
+		go func() { defer wg.Done(); snapsAB, errAB = s.SealGroup(opCtx, []string{a.ID, b.ID}) }()
+		go func() { defer wg.Done(); snapsBA, errBA = p2.SealGroup(opCtx, []string{b.ID, a.ID}) }()
 		go func() { defer wg.Done(); _, _ = p3.SubmitChunk(opCtx, b.ID, 1, []byte("final")) }()
 
 		done := make(chan struct{})
@@ -650,11 +729,47 @@ func TestSealGroupThreeWayRace(t *testing.T) {
 				t.Fatalf("round %d: members sealed by different transactions: %v vs %v",
 					i, snapA.SealedAt, snapB.SealedAt)
 			}
+			// A group that returned success must describe the committed
+			// state, not the rows it read before blocking. A group that
+			// raced the final chunk may legitimately have answered
+			// INCOMPLETE earlier; the forbidden answer is nil error plus a
+			// stale OPEN snapshot.
+			dbByID := map[string]*store.Snapshot{a.ID: snapA, b.ID: snapB}
+			for _, res := range []struct {
+				snaps []*store.Snapshot
+				err   error
+			}{{snapsAB, errAB}, {snapsBA, errBA}} {
+				if res.err != nil {
+					if !errors.Is(res.err, store.ErrIncomplete) {
+						t.Fatalf("round %d: unexpected group error: %v", i, res.err)
+					}
+					for _, got := range res.snaps {
+						if got.Status == store.StatusSealed || got.SealedAt != nil {
+							t.Fatalf("round %d: INCOMPLETE response reports sealed member: %+v", i, got)
+						}
+					}
+					continue
+				}
+				for _, got := range res.snaps {
+					db := dbByID[got.ID]
+					if got.Status != db.Status || got.SealedAt == nil ||
+						!got.SealedAt.Equal(*db.SealedAt) {
+						t.Fatalf("round %d: successful group response contradicts database for %s: response=%+v db=%+v",
+							i, got.ID, got, db)
+					}
+				}
+			}
 		} else {
 			// No new seal happened: both group calls must have reported
 			// INCOMPLETE and nothing may have transitioned.
 			if !errors.Is(errAB, store.ErrIncomplete) || !errors.Is(errBA, store.ErrIncomplete) {
 				t.Fatalf("round %d: unsealed but errors were %v / %v", i, errAB, errBA)
+			}
+			// Incomplete responses must not claim members are sealed.
+			for _, got := range append(snapsAB, snapsBA...) {
+				if got.Status == store.StatusSealed || got.SealedAt != nil {
+					t.Fatalf("round %d: INCOMPLETE response reports sealed member: %+v", i, got)
+				}
 			}
 		}
 	}
@@ -681,8 +796,9 @@ func TestSealGroupVsSingleSealRace(t *testing.T) {
 
 		var wg sync.WaitGroup
 		wg.Add(2)
+		var groupSnaps []*store.Snapshot
 		var groupErr, singleErr error
-		go func() { defer wg.Done(); _, groupErr = s.SealGroup(ctx, []string{a.ID, b.ID}) }()
+		go func() { defer wg.Done(); groupSnaps, groupErr = s.SealGroup(ctx, []string{a.ID, b.ID}) }()
 		go func() { defer wg.Done(); _, singleErr = other.SealBatch(ctx, b.ID) }()
 		wg.Wait()
 
@@ -699,6 +815,18 @@ func TestSealGroupVsSingleSealRace(t *testing.T) {
 		}
 		if snapA.Status != store.StatusSealed || snapB.Status != store.StatusSealed {
 			t.Fatalf("round %d: expected both SEALED: %s / %s", i, snapA.Status, snapB.Status)
+		}
+
+		// The group response must never contradict the committed rows: every member
+		// it reports is sealed with the exact stored sealedAt.
+		dbByID := map[string]*store.Snapshot{a.ID: snapA, b.ID: snapB}
+		for _, got := range groupSnaps {
+			db := dbByID[got.ID]
+			if got.Status != store.StatusSealed || got.SealedAt == nil ||
+				!got.SealedAt.Equal(*db.SealedAt) {
+				t.Fatalf("round %d: group response contradicts database: response=%+v db=%+v",
+					i, got, db)
+			}
 		}
 
 		// A second group seal must not move either sealedAt.

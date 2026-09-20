@@ -286,10 +286,14 @@ func (s *Store) SealBatch(ctx context.Context, batchID string) (*Snapshot, error
 // transaction — the same row-lock arbitration SubmitChunk and SealBatch use
 // for their one row — so a reversed pair of group requests, a single-batch
 // seal and the final chunk submission serialise on the same locks without
-// deadlocking. Gaps are computed from the post-lock snapshot, and the group
-// commits only when every OPEN member is complete: the batch set can never
-// be observed partially sealed. Members already SEALED count as idempotent
-// successes and keep their original sealedAt.
+// deadlocking. Locking, the gap verdict and the UPDATE are all one
+// transaction: the group itself never leaves a partial seal behind and its
+// response always matches the committed rows. Gaps are computed from the
+// post-lock snapshot; the group commits only when every OPEN member is
+// complete. A member sealed by a transaction that serialised just before the
+// group (e.g. a concurrent single-batch seal) is treated by the documented
+// idempotent rule — success, original sealedAt preserved — and the remaining
+// OPEN members seal together.
 //
 // Return values:
 //
@@ -383,15 +387,16 @@ func (s *Store) SealGroup(ctx context.Context, ids []string) ([]*Snapshot, error
 		}
 	}
 
-	// End the read-only validation transaction before applying the write so
-	// row locks are not held while UPDATE results are collected.
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-
-	// Seal every OPEN member in one statement; SEALED members are untouched
-	// and keep their stored sealedAt.
-	sealRows, err := s.pool.Query(ctx,
+	// Apply the seal inside the SAME transaction while the member rows are still
+	// locked. Locking, deciding and writing must be one transaction: releasing
+	// the locks between the verdict and the UPDATE would let a concurrent single
+	// seal or a reversed group request commit in between, exposing a partially
+	// sealed group and stamping members from different transactions. now() is the
+	// transaction timestamp, so every newly sealed member gets one sealedAt.
+	// SEALED members are untouched and keep their stored sealedAt; a reversed
+	// group request that lost the race updates zero rows and returns the
+	// winners' post-lock rows below, so its response matches the database.
+	sealRows, err := tx.Query(ctx,
 		`UPDATE batches SET status = $1, sealed_at = now()
 		 WHERE id = ANY($2) AND status = $3
 		 RETURNING id, sealed_at`, StatusSealed, sorted, StatusOpen)
@@ -414,6 +419,9 @@ func (s *Store) SealGroup(ctx context.Context, ids []string) ([]*Snapshot, error
 		return nil, err
 	}
 
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
 	return ordered, nil
 }
 

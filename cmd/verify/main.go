@@ -60,6 +60,7 @@ func main() {
 	v.checkValidation(ctx)
 	v.checkCrossInstanceSealRace(ctx)
 	v.checkSealGroup(ctx)
+	v.checkSealGroupRace(ctx)
 
 	switch phase := os.Getenv("VERIFY_PHASE"); phase {
 	case "seed":
@@ -453,6 +454,210 @@ func (v *verifier) checkSealGroup(ctx context.Context) {
 		v.failf("group retry changed result: %v", retry)
 	}
 	v.log("seal-group acceptance passed on both instances")
+}
+
+// checkSealGroupRace drives two distinct storms against complete members:
+//
+//  1. [A,B] on one instance vs the reversed [B,A] group on the other. Both
+//     groups cover the identical row set, so one transaction seals the whole
+//     set with one sealedAt and the loser folds to it; every 200 response must
+//     echo the database and both members share a sealedAt.
+//  2. [A,B] group vs B's single-batch seal. The two operations share B's row
+//     lock and serialise: if the group wins it seals both atomically; if the
+//     single seal legitimately commits first, the group treats B as the
+//     documented idempotent member (keeping B's sealedAt) and seals A in its
+//     own transaction. Either way both members end SEALED, the group's 200
+//     matches the committed rows and no sealedAt is ever overwritten.
+func (v *verifier) checkSealGroupRace(ctx context.Context) {
+	v.checkReversedGroupRace(ctx)
+	v.checkGroupVsSingleSealRace(ctx)
+	v.log("seal-group concurrency acceptance passed")
+}
+
+func (v *verifier) groupResponseMatchesDB(i int, tag string, code int, body map[string]any,
+	dbByID map[string]map[string]any) {
+	if code == 409 && body["error"] == "INCOMPLETE" {
+		return
+	}
+	if code != 200 {
+		v.failf("%s round %d: group status=%d body=%v", tag, i, code, body)
+		return
+	}
+	members, _ := body["batches"].([]any)
+	if len(members) != len(dbByID) {
+		v.failf("%s round %d: group response member count wrong: %v", tag, i, body)
+		return
+	}
+	for _, raw := range members {
+		m, _ := raw.(map[string]any)
+		id, _ := m["batchId"].(string)
+		db := dbByID[id]
+		if db == nil {
+			v.failf("%s round %d: unexpected member id %s", tag, i, id)
+			continue
+		}
+		// A 200 must never carry stale OPEN rows from before the lock wait.
+		if m["status"] != "SEALED" || m["sealedAt"] == nil {
+			v.failf("%s round %d: 200 response reports %s as %v sealedAt=%v",
+				tag, i, id, m["status"], m["sealedAt"])
+			continue
+		}
+		if m["sealedAt"] != db["sealedAt"] {
+			v.failf("%s round %d: response contradicts database for %s: %v vs %v",
+				tag, i, id, m["sealedAt"], db["sealedAt"])
+		}
+	}
+}
+
+func (v *verifier) checkReversedGroupRace(ctx context.Context) {
+	const rounds = 25
+	for i := 0; i < rounds; i++ {
+		a := v.createBatch(ctx, v.cfg.api1, 1)
+		b := v.createBatch(ctx, v.cfg.api2, 1)
+		if a == "" || b == "" {
+			return
+		}
+		for _, f := range []struct {
+			base, id string
+		}{{v.cfg.api2, a}, {v.cfg.api1, b}} {
+			code, body, _ := v.request(ctx, http.MethodPost, f.base+"/api/v1/batches/"+f.id+"/chunks",
+				map[string]any{"seq": 1, "payload": "x"})
+			if code != 201 {
+				v.failf("reversed-group round %d: fixture chunk %s: %d %v", i, f.id, code, body)
+				return
+			}
+		}
+		sealGroup := func(base string, ids []string) (int, map[string]any) {
+			code, body, _ := v.request(ctx, http.MethodPost, base+"/api/v1/batches/seal-group",
+				map[string]any{"batchIds": ids})
+			return code, body
+		}
+
+		type groupResp struct {
+			code int
+			body map[string]any
+		}
+		abCh, baCh := make(chan groupResp, 1), make(chan groupResp, 1)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			code, body := sealGroup(v.cfg.api1, []string{a, b})
+			abCh <- groupResp{code, body}
+		}()
+		go func() {
+			defer wg.Done()
+			code, body := sealGroup(v.cfg.api2, []string{b, a})
+			baCh <- groupResp{code, body}
+		}()
+		wg.Wait()
+		ab, ba := <-abCh, <-baCh
+
+		code, snapA, _ := v.request(ctx, http.MethodGet, v.cfg.api1+"/api/v1/batches/"+a, nil)
+		if code != 200 {
+			v.failf("reversed-group round %d: status A: %d", i, code)
+			continue
+		}
+		code, snapB, _ := v.request(ctx, http.MethodGet, v.cfg.api2+"/api/v1/batches/"+b, nil)
+		if code != 200 {
+			v.failf("reversed-group round %d: status B: %d", i, code)
+			continue
+		}
+		if snapA["status"] != "SEALED" || snapB["status"] != "SEALED" {
+			v.failf("reversed-group round %d: not both SEALED: %v / %v",
+				i, snapA["status"], snapB["status"])
+			continue
+		}
+		// Identical row sets: one winning transaction sealed both, so the
+		// sealedAt timestamps must be exactly equal.
+		if snapA["sealedAt"] != snapB["sealedAt"] {
+			v.failf("reversed-group round %d: members sealed in different transactions: %v vs %v",
+				i, snapA["sealedAt"], snapB["sealedAt"])
+		}
+		dbByID := map[string]map[string]any{a: snapA, b: snapB}
+		v.groupResponseMatchesDB(i, "reversed-group", ab.code, ab.body, dbByID)
+		v.groupResponseMatchesDB(i, "reversed-group", ba.code, ba.body, dbByID)
+	}
+}
+
+func (v *verifier) checkGroupVsSingleSealRace(ctx context.Context) {
+	const rounds = 25
+	for i := 0; i < rounds; i++ {
+		a := v.createBatch(ctx, v.cfg.api1, 1)
+		b := v.createBatch(ctx, v.cfg.api2, 1)
+		if a == "" || b == "" {
+			return
+		}
+		for _, f := range []struct {
+			base, id string
+		}{{v.cfg.api2, a}, {v.cfg.api1, b}} {
+			code, body, _ := v.request(ctx, http.MethodPost, f.base+"/api/v1/batches/"+f.id+"/chunks",
+				map[string]any{"seq": 1, "payload": "x"})
+			if code != 201 {
+				v.failf("group-vs-single round %d: fixture chunk %s: %d %v", i, f.id, code, body)
+				return
+			}
+		}
+
+		groupCh := make(chan struct {
+			code int
+			body map[string]any
+		}, 1)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			code, body, _ := v.request(ctx, http.MethodPost, v.cfg.api1+"/api/v1/batches/seal-group",
+				map[string]any{"batchIds": []string{a, b}})
+			groupCh <- struct {
+				code int
+				body map[string]any
+			}{code, body}
+		}()
+		go func() {
+			defer wg.Done()
+			// B's single-batch seal interleaves with the group call.
+			v.request(ctx, http.MethodPost, v.cfg.api2+"/api/v1/batches/"+b+"/seal", nil)
+		}()
+		wg.Wait()
+		group := <-groupCh
+
+		code, snapA, _ := v.request(ctx, http.MethodGet, v.cfg.api1+"/api/v1/batches/"+a, nil)
+		if code != 200 {
+			v.failf("group-vs-single round %d: status A: %d", i, code)
+			continue
+		}
+		code, snapB, _ := v.request(ctx, http.MethodGet, v.cfg.api2+"/api/v1/batches/"+b, nil)
+		if code != 200 {
+			v.failf("group-vs-single round %d: status B: %d", i, code)
+			continue
+		}
+		if snapA["status"] != "SEALED" || snapB["status"] != "SEALED" {
+			v.failf("group-vs-single round %d: not both SEALED: %v / %v",
+				i, snapA["status"], snapB["status"])
+			continue
+		}
+		dbByID := map[string]map[string]any{a: snapA, b: snapB}
+		v.groupResponseMatchesDB(i, "group-vs-single", group.code, group.body, dbByID)
+
+		// A follow-up group seal must leave both stored sealedAt untouched.
+		code, retry, _ := v.request(ctx, http.MethodPost, v.cfg.api2+"/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{b, a}})
+		if code != 200 {
+			v.failf("group-vs-single round %d: retry group status=%d body=%v", i, code, retry)
+			continue
+		}
+		members, _ := retry["batches"].([]any)
+		byID := map[string]any{}
+		for _, raw := range members {
+			m, _ := raw.(map[string]any)
+			byID[m["batchId"].(string)] = m["sealedAt"]
+		}
+		if byID[a] != snapA["sealedAt"] || byID[b] != snapB["sealedAt"] {
+			v.failf("group-vs-single round %d: retry moved sealedAt: retry A=%v B=%v, db A=%v B=%v",
+				i, byID[a], byID[b], snapA["sealedAt"], snapB["sealedAt"])
+		}
+	}
 }
 
 // persistedState is handed across the API restart via a shared volume.

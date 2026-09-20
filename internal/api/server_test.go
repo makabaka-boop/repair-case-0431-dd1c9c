@@ -645,21 +645,30 @@ func TestHTTPSealGroupThreeWayRace(t *testing.T) {
 			body map[string]any
 		}
 		resCh := make(chan result, 3)
+		var groupAB, groupBA result
+		var wg sync.WaitGroup
+		wg.Add(3)
 		go func() {
+			defer wg.Done()
 			code, resp := c.postQuiet(u1+"/api/v1/batches/seal-group",
 				map[string]any{"batchIds": []string{a, b}})
-			resCh <- result{code, resp}
+			groupAB = result{code, resp}
+			resCh <- groupAB
 		}()
 		go func() {
+			defer wg.Done()
 			code, resp := c.postQuiet(u2+"/api/v1/batches/seal-group",
 				map[string]any{"batchIds": []string{b, a}})
-			resCh <- result{code, resp}
+			groupBA = result{code, resp}
+			resCh <- groupBA
 		}()
 		go func() {
+			defer wg.Done()
 			code, resp := c.postQuiet(u1+"/api/v1/batches/"+b+"/chunks",
 				map[string]any{"seq": 1, "payload": "final"})
 			resCh <- result{code, resp}
 		}()
+		wg.Wait()
 
 		var results []result
 		timeout := time.After(30 * time.Second)
@@ -697,6 +706,46 @@ func TestHTTPSealGroupThreeWayRace(t *testing.T) {
 			if snapA["sealedAt"] != snapB["sealedAt"] {
 				t.Fatalf("round %d: members sealed by different transactions: %v vs %v",
 					i, snapA["sealedAt"], snapB["sealedAt"])
+			}
+			// A 200 group response must agree with the database: the
+			// loser of the lock race echoes the winner's committed rows
+			// instead of stale OPEN snapshots taken before it blocked.
+			// A 409 INCOMPLETE is also legal here when the group verdict
+			// raced B's final chunk; the forbidden outcome is a 200 with
+			// stale OPEN members.
+			dbByID := map[string]map[string]any{a: snapA, b: snapB}
+			for _, g := range []result{groupAB, groupBA} {
+				if g.code == 409 && g.body["error"] == "INCOMPLETE" {
+					continue
+				}
+				if g.code != 200 {
+					t.Fatalf("round %d: group response status=%d body=%v", i, g.code, g.body)
+				}
+				members, _ := g.body["batches"].([]any)
+				if len(members) != 2 {
+					t.Fatalf("round %d: group response missing members: %v", i, g.body)
+				}
+				for _, raw := range members {
+					m, _ := raw.(map[string]any)
+					id, _ := m["batchId"].(string)
+					db := dbByID[id]
+					if m["status"] != "SEALED" || m["sealedAt"] == nil {
+						t.Fatalf("round %d: 200 group response reports %s as %v sealedAt=%v",
+							i, id, m["status"], m["sealedAt"])
+					}
+					if m["sealedAt"] != db["sealedAt"] {
+						t.Fatalf("round %d: group response contradicts database for %s: %v vs %v",
+							i, id, m["sealedAt"], db["sealedAt"])
+					}
+				}
+			}
+		} else {
+			// Unsealed: both group calls must honestly report 409
+			// INCOMPLETE, never a 200 carrying stale OPEN rows.
+			for _, g := range []result{groupAB, groupBA} {
+				if g.code != 409 || g.body["error"] != "INCOMPLETE" {
+					t.Fatalf("round %d: unsealed but group response was %d %v", i, g.code, g.body)
+				}
 			}
 		}
 	}
